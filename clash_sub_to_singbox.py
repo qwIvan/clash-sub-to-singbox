@@ -324,11 +324,33 @@ def main():
     ap = argparse.ArgumentParser(
         description="从 Clash 订阅（YAML）生成 sing-box 多端口 SOCKS->(SS/Trojan) 配置"
     )
-    ap.add_argument("--sub-url", required=True, help="Clash 订阅链接（YAML）")
+    ap.add_argument(
+        "--sub-url",
+        required=True,
+        action="append",
+        help="Clash 订阅链接，可重复或用逗号分隔多个",
+    )
     ap.add_argument("--output", default="config.json", help="输出 sing-box 配置文件路径")
     ap.add_argument("--listen", default="127.0.0.1", help="SOCKS 监听地址（默认 127.0.0.1）")
     ap.add_argument("--base-port", type=int, default=20101, help="端口起始值（默认 20101）")
-    ap.add_argument("--port-range", type=int, default=10, help="端口池大小（默认 99：20101-20110）")
+    ap.add_argument("--port-range", type=int, default=99, help="端口池大小（默认 99：20101-20110）")
+    ap.add_argument("--urltest-port", type=int, default=20100, help="汇总 urltest SOCKS 端口（默认 20100，不占用节点端口池）")
+    ap.add_argument(
+        "--urltest-url",
+        default=None,
+        help="urltest 测速地址（若不指定则配置中留空）",
+    )
+    ap.add_argument(
+        "--urltest-interval",
+        default=None,
+        help="urltest 轮询间隔，sing-box 时长格式，如 5m（若不指定则配置中留空）",
+    )
+    ap.add_argument(
+        "--urltest-tolerance",
+        type=int,
+        default=10,
+        help="urltest 额外延迟容忍毫秒（若不指定则配置中留空）",
+    )
     ap.add_argument(
         "--types",
         default="ss,trojan",
@@ -350,14 +372,22 @@ def main():
     if args.socks_pass and not args.socks_user:
         ap.error("设置了 --socks-pass 必须同时设置 --socks-user")
 
-    raw = fetch_text(args.sub_url, timeout=args.timeout)
-    doc = load_clash_subscription(raw)
+    sub_urls = []
+    for grp in args.sub_url:
+        sub_urls.extend([u.strip() for u in grp.split(",") if u.strip()])
+    if not sub_urls:
+        ap.error("至少需要一个 --sub-url")
 
-    proxies = doc.get("proxies")
-    if not isinstance(proxies, list):
-        raise SystemExit(
-            "订阅里没找到 proxies 列表。若你的订阅用了 proxy-providers 动态拉取，需要先在 Clash/Mihomo 侧展开或换成含 proxies 的订阅。"
-        )
+    proxies = []
+    for url in sub_urls:
+        raw = fetch_text(url, timeout=args.timeout)
+        doc = load_clash_subscription(raw)
+        p_list = doc.get("proxies")
+        if not isinstance(p_list, list):
+            raise SystemExit(
+                f"订阅 {url} 里没找到 proxies 列表。若用了 proxy-providers，需要先展开或换成含 proxies 的订阅。"
+            )
+        proxies.extend(p_list)
 
     nodes = []
     warnings = []
@@ -401,11 +431,21 @@ def main():
     rules = []
 
     socks_lines = []
+    urltest_socks_line = None
+
+    auth_prefix = ""
+    if args.socks_user:
+        user = urllib.parse.quote(args.socks_user, safe="")
+        pw = urllib.parse.quote(args.socks_pass or "", safe="")
+        auth_prefix = f"{user}:{pw}@"
+
+    out_tags = []
 
     for (tag, uniq_key, outbound) in nodes:
         port = port_map[uniq_key]
         in_tag = f"in_{tag}"
         out_tag = f"out_{tag}"
+        out_tags.append(out_tag)
 
         inbound = {
             "type": "socks",
@@ -421,13 +461,37 @@ def main():
         inbounds.append(inbound)
         outbounds.append(outbound)
         rules.append({"inbound": in_tag, "outbound": out_tag})
+        socks_lines.append(f"socks5://{auth_prefix}{args.listen}:{port}")
 
-        auth = ""
+    # 默认增加一个 urltest 汇总出站（tag=auto），包含所有匹配节点；可选再绑定独立 SOCKS 入口。
+    urltest_out_tag = "auto"
+    urltest_ob = {
+        "type": "urltest",
+        "tag": urltest_out_tag,
+        "outbounds": out_tags,
+    }
+    if args.urltest_url:
+        urltest_ob["url"] = args.urltest_url
+    if args.urltest_interval:
+        urltest_ob["interval"] = args.urltest_interval
+    if args.urltest_tolerance is not None:
+        urltest_ob["tolerance"] = args.urltest_tolerance
+    outbounds.append(urltest_ob)
+
+    if args.urltest_port:
+        urltest_in_tag = "in_urltest"
+        urltest_inbound = {
+            "type": "socks",
+            "tag": urltest_in_tag,
+            "listen": args.listen,
+            "listen_port": args.urltest_port,
+        }
         if args.socks_user:
-            user = urllib.parse.quote(args.socks_user, safe="")
-            pw = urllib.parse.quote(args.socks_pass or "", safe="")
-            auth = f"{user}:{pw}@"
-        socks_lines.append(f"socks5://{auth}{args.listen}:{port}")
+            urltest_inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
+
+        inbounds.append(urltest_inbound)
+        rules.append({"inbound": urltest_in_tag, "outbound": urltest_out_tag})
+        urltest_socks_line = f"socks5://{auth_prefix}{args.listen}:{args.urltest_port}"
 
     config = {
         "log": {"level": "info"},
@@ -442,11 +506,16 @@ def main():
         json.dump(config, f, ensure_ascii=False, indent=2)
 
     print(f"已生成：{args.output}")
-    print(f"节点数：{len(nodes)}，SOCKS 端口范围：{args.base_port} - {args.base_port + args.port_range - 1}")
+    print(f"订阅数：{len(sub_urls)}，节点数：{len(nodes)}，SOCKS 端口范围：{args.base_port} - {args.base_port + args.port_range - 1}")
+    if args.urltest_port:
+        print(f"urltest 汇总入口：socks5://{auth_prefix}{args.listen}:{args.urltest_port}")
     print("示例测试：curl --socks5 127.0.0.1:<port> https://ifconfig.me")
     print("\nSOCKS5 代理列表（每行一个）：")
     for line in socks_lines:
         print(line)
+    if urltest_socks_line:
+        print("urltest 聚合入口：")
+        print(urltest_socks_line)
     if warnings:
         print("\n注意：发现部分节点包含 plugin 等字段，脚本未自动转换：")
         for w in warnings[:20]:
