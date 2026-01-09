@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import sys
+import fnmatch
 import urllib.request
 import urllib.parse
 from urllib.error import URLError, HTTPError
@@ -326,12 +327,17 @@ def main():
     ap.add_argument("--sub-url", required=True, help="Clash 订阅链接（YAML）")
     ap.add_argument("--output", default="config.json", help="输出 sing-box 配置文件路径")
     ap.add_argument("--listen", default="127.0.0.1", help="SOCKS 监听地址（默认 127.0.0.1）")
-    ap.add_argument("--base-port", type=int, default=20000, help="端口起始值（默认 20000）")
-    ap.add_argument("--port-range", type=int, default=2000, help="端口池大小（默认 2000：20000-21999）")
+    ap.add_argument("--base-port", type=int, default=20101, help="端口起始值（默认 20101）")
+    ap.add_argument("--port-range", type=int, default=10, help="端口池大小（默认 99：20101-20110）")
     ap.add_argument(
         "--types",
         default="ss,trojan",
         help="处理的节点类型（逗号分隔，支持 ss,trojan；默认 ss,trojan）",
+    )
+    ap.add_argument(
+        "--tag-pattern",
+        action="append",
+        help="可选：按通配符匹配 tag，仅保留匹配的节点；可重复或用逗号分隔，例如 'HK*', 'US-*,JP-*'",
     )
     ap.add_argument("--socks-user", default=None, help="可选：SOCKS 用户名（开启认证）")
     ap.add_argument("--socks-pass", default=None, help="可选：SOCKS 密码（开启认证）")
@@ -355,6 +361,19 @@ def main():
 
     nodes = []
     warnings = []
+
+    # 处理 tag pattern，支持多次传参或逗号分隔，使用 shell 通配符匹配（fnmatch）
+    tag_patterns = []
+    if args.tag_pattern:
+        for grp in args.tag_pattern:
+            tag_patterns.extend([p.strip() for p in grp.split(",") if p.strip()])
+
+    def tag_allowed(tag: str) -> bool:
+        if not tag_patterns:
+            return True
+        t = tag.lower()
+        return any(fnmatch.fnmatch(t, pat.lower()) for pat in tag_patterns)
+
     for p in proxies:
         if not isinstance(p, dict):
             continue
@@ -363,6 +382,8 @@ def main():
             continue
         tag, uniq_key, outbound = build_outbound_from_clash_proxy(p)
         if outbound:
+            if not tag_allowed(tag):
+                continue
             if "_warning" in outbound:
                 warnings.append(f"{tag}: {outbound['_warning']}")
                 outbound.pop("_warning", None)
@@ -389,7 +410,6 @@ def main():
             "tag": in_tag,
             "listen": args.listen,
             "listen_port": port,
-            "sniff": True
         }
         if args.socks_user:
             inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
@@ -400,16 +420,12 @@ def main():
         outbounds.append(outbound)
         rules.append({"inbound": in_tag, "outbound": out_tag})
 
-    # 加一个 direct 作为 final，避免漏匹配时出错
-    outbounds.append({"type": "direct", "tag": "direct"})
-
     config = {
         "log": {"level": "info"},
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
             "rules": rules,
-            "final": "direct"
         }
     }
 
