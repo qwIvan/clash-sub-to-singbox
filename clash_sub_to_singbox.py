@@ -348,8 +348,18 @@ def main():
     ap.add_argument(
         "--urltest-tolerance",
         type=int,
-        default=10,
+        default=15,
         help="urltest 额外延迟容忍毫秒（若不指定则配置中留空）",
+    )
+    ap.add_argument(
+        "--clash-api-controller",
+        default="127.0.0.1:9090",
+        help="experimental.clash_api external_controller（默认 127.0.0.1:9090）",
+    )
+    ap.add_argument(
+        "--clash-api-secret",
+        default=None,
+        help="experimental.clash_api secret，指定则写入配置",
     )
     ap.add_argument(
         "--types",
@@ -501,6 +511,14 @@ def main():
             "rules": rules,
         }
     }
+
+    if args.clash_api_secret:
+        config["experimental"] = {
+            "clash_api": {
+                "external_controller": args.clash_api_controller,
+                "secret": args.clash_api_secret,
+            }
+        }
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
