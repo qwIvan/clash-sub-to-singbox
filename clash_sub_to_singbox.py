@@ -348,7 +348,7 @@ def main():
     ap.add_argument(
         "--urltest-tolerance",
         type=int,
-        default=15,
+        default=None,
         help="urltest 额外延迟容忍毫秒（若不指定则配置中留空）",
     )
     ap.add_argument(
