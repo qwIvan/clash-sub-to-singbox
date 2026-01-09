@@ -400,6 +400,8 @@ def main():
     outbounds = []
     rules = []
 
+    socks_lines = []
+
     for (tag, uniq_key, outbound) in nodes:
         port = port_map[uniq_key]
         in_tag = f"in_{tag}"
@@ -420,6 +422,13 @@ def main():
         outbounds.append(outbound)
         rules.append({"inbound": in_tag, "outbound": out_tag})
 
+        auth = ""
+        if args.socks_user:
+            user = urllib.parse.quote(args.socks_user, safe="")
+            pw = urllib.parse.quote(args.socks_pass or "", safe="")
+            auth = f"{user}:{pw}@"
+        socks_lines.append(f"socks5://{auth}{args.listen}:{port}")
+
     config = {
         "log": {"level": "info"},
         "inbounds": inbounds,
@@ -435,6 +444,9 @@ def main():
     print(f"已生成：{args.output}")
     print(f"节点数：{len(nodes)}，SOCKS 端口范围：{args.base_port} - {args.base_port + args.port_range - 1}")
     print("示例测试：curl --socks5 127.0.0.1:<port> https://ifconfig.me")
+    print("\nSOCKS5 代理列表（每行一个）：")
+    for line in socks_lines:
+        print(line)
     if warnings:
         print("\n注意：发现部分节点包含 plugin 等字段，脚本未自动转换：")
         for w in warnings[:20]:
