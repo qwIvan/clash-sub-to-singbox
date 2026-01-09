@@ -331,7 +331,7 @@ def main():
         help="Clash 订阅链接，可重复或用逗号分隔多个",
     )
     ap.add_argument("--output", default="config.json", help="输出 sing-box 配置文件路径")
-    ap.add_argument("--listen", default="127.0.0.1", help="SOCKS 监听地址（默认 127.0.0.1）")
+    ap.add_argument("--listen", default="0.0.0.0", help="SOCKS 监听地址（默认 0.0.0.0）")
     ap.add_argument("--base-port", type=int, default=20101, help="端口起始值（默认 20101）")
     ap.add_argument("--port-range", type=int, default=99, help="端口池大小（默认 99：20101-20110）")
     ap.add_argument("--urltest-port", type=int, default=20100, help="汇总 urltest SOCKS 端口（默认 20100，不占用节点端口池）")
