@@ -471,7 +471,7 @@ def main():
         inbounds.append(inbound)
         outbounds.append(outbound)
         rules.append({"inbound": in_tag, "outbound": out_tag})
-        socks_lines.append(f"socks5://{auth_prefix}{args.listen}:{port}")
+        socks_lines.append(f"socks5h://{auth_prefix}{args.listen}:{port}")
 
     # 默认增加一个 urltest 汇总出站（tag=auto），包含所有匹配节点；可选再绑定独立 SOCKS 入口。
     urltest_out_tag = "auto"
@@ -501,7 +501,7 @@ def main():
 
         inbounds.append(urltest_inbound)
         rules.append({"inbound": urltest_in_tag, "outbound": urltest_out_tag})
-        urltest_socks_line = f"socks5://{auth_prefix}{args.listen}:{args.urltest_port}"
+        urltest_socks_line = f"socks5h://{auth_prefix}{args.listen}:{args.urltest_port}"
 
     config = {
         "log": {"level": "info"},
@@ -526,8 +526,8 @@ def main():
     print(f"已生成：{args.output}")
     print(f"订阅数：{len(sub_urls)}，节点数：{len(nodes)}，SOCKS 端口范围：{args.base_port} - {args.base_port + args.port_range - 1}")
     if args.urltest_port:
-        print(f"urltest 汇总入口：socks5://{auth_prefix}{args.listen}:{args.urltest_port}")
-    print("示例测试：curl --socks5 127.0.0.1:<port> https://ifconfig.me")
+        print(f"urltest 汇总入口：socks5h://{auth_prefix}{args.listen}:{args.urltest_port}")
+    print("示例测试：curl --socks5-hostname 127.0.0.1:<port> https://ifconfig.me")
     print("\nSOCKS5 代理列表（每行一个）：")
     for line in socks_lines:
         print(line)
