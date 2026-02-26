@@ -337,7 +337,7 @@ def main():
     ap.add_argument("--urltest-port", type=int, default=20100, help="汇总 urltest SOCKS 端口（默认 20100，不占用节点端口池）")
     ap.add_argument(
         "--urltest-url",
-        default=None,
+        default="https://chatgpt.com",
         help="urltest 测速地址（若不指定则配置中留空）",
     )
     ap.add_argument(
@@ -348,7 +348,7 @@ def main():
     ap.add_argument(
         "--urltest-tolerance",
         type=int,
-        default=None,
+        default=100,
         help="urltest 额外延迟容忍毫秒（若不指定则配置中留空）",
     )
     ap.add_argument(
@@ -504,7 +504,7 @@ def main():
         urltest_socks_line = f"socks5h://{auth_prefix}{args.listen}:{args.urltest_port}"
 
     config = {
-        "log": {"level": "info"},
+        "log": {"level": "debug"},
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
