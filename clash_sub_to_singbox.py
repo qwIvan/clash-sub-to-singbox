@@ -3,7 +3,6 @@
 
 import argparse
 import base64
-import hashlib
 import json
 import sys
 import fnmatch
@@ -217,22 +216,11 @@ def parse_trojan_uri(uri: str):
 
 def stable_port_assign(keys, base_port: int, port_range: int):
     """
-    使用 hash(key) % port_range 做初始落点，碰撞则线性探测，确保稳定映射。
+    按顺序依次分配端口：第 i 个节点分配 base_port + i。
     """
-    used = set()
-    mapping = {}  # key -> port
-    for k in keys:
-        h = hashlib.sha1(k.encode("utf-8")).digest()
-        start = int.from_bytes(h[:4], "big") % port_range
-        for i in range(port_range):
-            port = base_port + ((start + i) % port_range)
-            if port not in used:
-                used.add(port)
-                mapping[k] = port
-                break
-        else:
-            raise RuntimeError("端口池耗尽：port_range 太小，装不下这么多节点")
-    return mapping
+    if len(keys) > port_range:
+        raise RuntimeError("端口池耗尽：port_range 太小，装不下这么多节点")
+    return {k: base_port + i for i, k in enumerate(keys)}
 
 
 def norm_bool(v, default=False):
@@ -348,7 +336,7 @@ def main():
     ap.add_argument(
         "--urltest-tolerance",
         type=int,
-        default=100,
+        default=None,
         help="urltest 额外延迟容忍毫秒（若不指定则配置中留空）",
     )
     ap.add_argument(
@@ -371,10 +359,53 @@ def main():
         action="append",
         help="可选：按通配符匹配 tag，仅保留匹配的节点；可重复或用逗号分隔，例如 'HK*', 'US-*,JP-*'",
     )
+    ap.add_argument(
+        "--no-per-node-socks",
+        action="store_true",
+        default=False,
+        help="不为每个节点单独创建 SOCKS 入口，只保留 urltest 汇总入口",
+    )
     ap.add_argument("--socks-user", default=None, help="可选：SOCKS 用户名（开启认证）")
     ap.add_argument("--socks-pass", default=None, help="可选：SOCKS 密码（开启认证）")
     ap.add_argument("--timeout", type=int, default=20, help="订阅拉取超时秒数（默认 20）")
+    ap.add_argument(
+        "--group",
+        action="append",
+        dest="groups",
+        metavar="PATTERNS:URLTEST_PORT",
+        help="分组规则，格式：'模式1,模式2:urltest端口[:测速URL]'；节点端口从 urltest端口+1 起分配；可重复",
+    )
     args = ap.parse_args()
+
+    # 解析 --group 参数
+    groups = []  # list of (patterns: list[str], urltest_port: int, urltest_url: str|None)
+    if args.groups:
+        for g in args.groups:
+            # 格式：模式1,模式2:端口  或  模式1,模式2:端口:测速URL
+            parts = g.split(":")
+            # URL 里含冒号（https://...），从左数第二个冒号是端口/URL 的分隔点
+            # 用 rfind 找最后一个冒号前的部分是否是整数来判断有没有 URL
+            # 更稳健：先找第一个冒号（分隔 patterns 和剩余），剩余里再分一次
+            first_colon = g.find(":")
+            if first_colon == -1:
+                ap.error(f"--group 格式错误（缺少端口）：{g!r}")
+            patterns_part = g[:first_colon]
+            rest = g[first_colon + 1:]  # "端口" 或 "端口:测速URL"
+            second_colon = rest.find(":")
+            if second_colon == -1:
+                port_part = rest
+                group_url = None
+            else:
+                port_part = rest[:second_colon]
+                group_url = rest[second_colon + 1:] or None
+            try:
+                urltest_port = int(port_part)
+            except ValueError:
+                ap.error(f"--group 端口必须是整数：{port_part!r}")
+            pats = [p.strip() for p in patterns_part.split(",") if p.strip()]
+            if not pats:
+                ap.error(f"--group 模式不能为空：{g!r}")
+            groups.append((pats, urltest_port, group_url))
 
     want_types = {t.strip().lower() for t in args.types.split(",") if t.strip()}
     if args.socks_user and not args.socks_pass:
@@ -432,16 +463,9 @@ def main():
     if not nodes:
         raise SystemExit(f"没有找到匹配类型的节点（types={sorted(want_types)}）")
 
-    # 稳定分配端口
-    uniq_keys = [u for (_, u, _) in nodes]
-    port_map = stable_port_assign(uniq_keys, args.base_port, args.port_range)
-
     inbounds = []
     outbounds = []
     rules = []
-
-    socks_lines = []
-    urltest_socks_line = None
 
     auth_prefix = ""
     if args.socks_user:
@@ -449,29 +473,154 @@ def main():
         pw = urllib.parse.quote(args.socks_pass or "", safe="")
         auth_prefix = f"{user}:{pw}@"
 
+    if groups:
+        # ---------- 分组模式 ----------
+        if args.tag_pattern or args.base_port != 20101 or args.urltest_port != 20100:
+            print("提示：--group 模式下，--tag-pattern / --urltest-port / --base-port 被忽略", file=sys.stderr)
+
+        def node_group_index(tag, grps):
+            t = tag.lower()
+            for i, (pats, _, _) in enumerate(grps):
+                if any(fnmatch.fnmatch(t, p.lower()) for p in pats):
+                    return i
+            return -1
+
+        group_nodes = [[] for _ in groups]
+        for (tag, uniq_key, outbound) in nodes:
+            gi = node_group_index(tag, groups)
+            if gi == -1:
+                continue
+            group_nodes[gi].append((tag, uniq_key, outbound))
+
+        socks_lines = []
+        urltest_socks_lines = []
+
+        for gi, (pats, urltest_port, group_url) in enumerate(groups):
+            g_nodes = group_nodes[gi]
+            if not g_nodes:
+                print(f"警告：组 {pats} 没有匹配节点，跳过", file=sys.stderr)
+                continue
+            base_port = urltest_port + 1
+            uniq_keys = [u for (_, u, _) in g_nodes]
+            port_map = stable_port_assign(uniq_keys, base_port, args.port_range)
+
+            out_tags = []
+            for (tag, uniq_key, outbound) in g_nodes:
+                port = port_map[uniq_key]
+                out_tag = f"out_{tag}"
+                out_tags.append(out_tag)
+
+                if not args.no_per_node_socks:
+                    in_tag = f"in_{tag}"
+                    inbound = {
+                        "type": "socks",
+                        "tag": in_tag,
+                        "listen": args.listen,
+                        "listen_port": port,
+                    }
+                    if args.socks_user:
+                        inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
+                    inbounds.append(inbound)
+                    rules.append({"inbound": in_tag, "outbound": out_tag})
+                    socks_lines.append(f"socks5h://{auth_prefix}{args.listen}:{port}")
+
+                outbound["tag"] = out_tag
+                outbounds.append(outbound)
+
+            urltest_out_tag = f"auto_{urltest_port}"
+            urltest_ob = {
+                "type": "urltest",
+                "tag": urltest_out_tag,
+                "outbounds": out_tags,
+            }
+            effective_url = group_url if group_url is not None else args.urltest_url
+            if effective_url:
+                urltest_ob["url"] = effective_url
+            if args.urltest_interval:
+                urltest_ob["interval"] = args.urltest_interval
+            if args.urltest_tolerance is not None:
+                urltest_ob["tolerance"] = args.urltest_tolerance
+            outbounds.append(urltest_ob)
+
+            urltest_in_tag = f"in_urltest_{urltest_port}"
+            urltest_inbound = {
+                "type": "socks",
+                "tag": urltest_in_tag,
+                "listen": args.listen,
+                "listen_port": urltest_port,
+            }
+            if args.socks_user:
+                urltest_inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
+            inbounds.append(urltest_inbound)
+            rules.append({"inbound": urltest_in_tag, "outbound": urltest_out_tag})
+            urltest_socks_lines.append((pats, urltest_port, len(g_nodes), group_url))
+
+        config = {
+            "log": {"level": "debug"},
+            "inbounds": inbounds,
+            "outbounds": outbounds,
+            "route": {"rules": rules},
+        }
+        if args.clash_api_secret:
+            config["experimental"] = {
+                "clash_api": {
+                    "external_controller": args.clash_api_controller,
+                    "secret": args.clash_api_secret,
+                }
+            }
+
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
+        print(f"已生成：{args.output}（分组模式，共 {len(groups)} 组）")
+        for pats, urltest_port, cnt, group_url in urltest_socks_lines:
+            effective_url = group_url if group_url is not None else args.urltest_url
+            print(f"  组 {pats}：{cnt} 个节点，urltest 入口 socks5h://{auth_prefix}{args.listen}:{urltest_port}，节点端口 {urltest_port+1}-{urltest_port+cnt}，测速 {effective_url}")
+        print("示例测试：curl --socks5-hostname 127.0.0.1:<port> https://ifconfig.me")
+        if socks_lines:
+            print("\nSOCKS5 代理列表（每行一个）：")
+            for line in socks_lines:
+                print(line)
+        if warnings:
+            print("\n注意：发现部分节点包含 plugin 等字段，脚本未自动转换：")
+            for w in warnings[:20]:
+                print("  -", w)
+            if len(warnings) > 20:
+                print(f"  ... 还有 {len(warnings)-20} 条")
+        return
+
+    # ---------- 原有单组模式 ----------
+    # 稳定分配端口
+    uniq_keys = [u for (_, u, _) in nodes]
+    port_map = stable_port_assign(uniq_keys, args.base_port, args.port_range)
+
+    socks_lines = []
+    urltest_socks_line = None
+
     out_tags = []
 
     for (tag, uniq_key, outbound) in nodes:
         port = port_map[uniq_key]
-        in_tag = f"in_{tag}"
         out_tag = f"out_{tag}"
         out_tags.append(out_tag)
 
-        inbound = {
-            "type": "socks",
-            "tag": in_tag,
-            "listen": args.listen,
-            "listen_port": port,
-        }
-        if args.socks_user:
-            inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
+        if not args.no_per_node_socks:
+            in_tag = f"in_{tag}"
+            inbound = {
+                "type": "socks",
+                "tag": in_tag,
+                "listen": args.listen,
+                "listen_port": port,
+            }
+            if args.socks_user:
+                inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
+
+            inbounds.append(inbound)
+            rules.append({"inbound": in_tag, "outbound": out_tag})
+            socks_lines.append(f"socks5h://{auth_prefix}{args.listen}:{port}")
 
         outbound["tag"] = out_tag
-
-        inbounds.append(inbound)
         outbounds.append(outbound)
-        rules.append({"inbound": in_tag, "outbound": out_tag})
-        socks_lines.append(f"socks5h://{auth_prefix}{args.listen}:{port}")
 
     # 默认增加一个 urltest 汇总出站（tag=auto），包含所有匹配节点；可选再绑定独立 SOCKS 入口。
     urltest_out_tag = "auto"
@@ -528,9 +677,10 @@ def main():
     if args.urltest_port:
         print(f"urltest 汇总入口：socks5h://{auth_prefix}{args.listen}:{args.urltest_port}")
     print("示例测试：curl --socks5-hostname 127.0.0.1:<port> https://ifconfig.me")
-    print("\nSOCKS5 代理列表（每行一个）：")
-    for line in socks_lines:
-        print(line)
+    if socks_lines:
+        print("\nSOCKS5 代理列表（每行一个）：")
+        for line in socks_lines:
+            print(line)
     if urltest_socks_line:
         print("urltest 聚合入口：")
         print(urltest_socks_line)
