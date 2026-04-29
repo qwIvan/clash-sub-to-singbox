@@ -466,6 +466,19 @@ def main():
     inbounds = []
     outbounds = []
     rules = []
+    used_listen_ports = {}
+
+    def add_inbound(inbound: dict):
+        """Append an inbound and fail fast if two inbounds try to listen on the same port."""
+        port = inbound.get("listen_port")
+        if port is not None:
+            previous_tag = used_listen_ports.get(port)
+            if previous_tag is not None:
+                raise SystemExit(
+                    f"监听端口冲突：{port} 已被 {previous_tag} 使用，不能再用于 {inbound.get('tag')}"
+                )
+            used_listen_ports[port] = inbound.get("tag")
+        inbounds.append(inbound)
 
     auth_prefix = ""
     if args.socks_user:
@@ -478,19 +491,17 @@ def main():
         if args.tag_pattern or args.base_port != 20101 or args.urltest_port != 20100:
             print("提示：--group 模式下，--tag-pattern / --urltest-port / --base-port 被忽略", file=sys.stderr)
 
-        def node_group_index(tag, grps):
+        def node_matches_group(tag, pats):
             t = tag.lower()
-            for i, (pats, _, _) in enumerate(grps):
-                if any(fnmatch.fnmatch(t, p.lower()) for p in pats):
-                    return i
-            return -1
+            return any(fnmatch.fnmatch(t, p.lower()) for p in pats)
 
         group_nodes = [[] for _ in groups]
         for (tag, uniq_key, outbound) in nodes:
-            gi = node_group_index(tag, groups)
-            if gi == -1:
-                continue
-            group_nodes[gi].append((tag, uniq_key, outbound))
+            # 每个 --group 都是独立过滤器；同一个节点可以同时进入多个组。
+            # 这样重复写同一组模式、但使用不同 urltest 端口/测速 URL 时不会被前一个组“抢走”。
+            for gi, (pats, _, _) in enumerate(groups):
+                if node_matches_group(tag, pats):
+                    group_nodes[gi].append((tag, uniq_key, outbound))
 
         socks_lines = []
         urltest_socks_lines = []
@@ -501,17 +512,17 @@ def main():
                 print(f"警告：组 {pats} 没有匹配节点，跳过", file=sys.stderr)
                 continue
             base_port = urltest_port + 1
-            uniq_keys = [u for (_, u, _) in g_nodes]
-            port_map = stable_port_assign(uniq_keys, base_port, args.port_range)
+            if len(g_nodes) > args.port_range:
+                raise RuntimeError("端口池耗尽：port_range 太小，装不下这么多节点")
 
             out_tags = []
-            for (tag, uniq_key, outbound) in g_nodes:
-                port = port_map[uniq_key]
-                out_tag = f"out_{tag}"
+            for node_offset, (tag, _uniq_key, outbound) in enumerate(g_nodes):
+                port = base_port + node_offset
+                out_tag = f"out_g{gi + 1}_{port}_{tag}"
                 out_tags.append(out_tag)
 
                 if not args.no_per_node_socks:
-                    in_tag = f"in_{tag}"
+                    in_tag = f"in_g{gi + 1}_{port}_{tag}"
                     inbound = {
                         "type": "socks",
                         "tag": in_tag,
@@ -520,14 +531,15 @@ def main():
                     }
                     if args.socks_user:
                         inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
-                    inbounds.append(inbound)
+                    add_inbound(inbound)
                     rules.append({"inbound": in_tag, "outbound": out_tag})
                     socks_lines.append(f"socks5h://{auth_prefix}{args.listen}:{port}")
 
-                outbound["tag"] = out_tag
-                outbounds.append(outbound)
+                outbound_instance = dict(outbound)
+                outbound_instance["tag"] = out_tag
+                outbounds.append(outbound_instance)
 
-            urltest_out_tag = f"auto_{urltest_port}"
+            urltest_out_tag = f"auto_g{gi + 1}_{urltest_port}"
             urltest_ob = {
                 "type": "urltest",
                 "tag": urltest_out_tag,
@@ -551,7 +563,7 @@ def main():
             }
             if args.socks_user:
                 urltest_inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
-            inbounds.append(urltest_inbound)
+            add_inbound(urltest_inbound)
             rules.append({"inbound": urltest_in_tag, "outbound": urltest_out_tag})
             urltest_socks_lines.append((pats, urltest_port, len(g_nodes), group_url))
 
@@ -615,7 +627,7 @@ def main():
             if args.socks_user:
                 inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
 
-            inbounds.append(inbound)
+            add_inbound(inbound)
             rules.append({"inbound": in_tag, "outbound": out_tag})
             socks_lines.append(f"socks5h://{auth_prefix}{args.listen}:{port}")
 
@@ -648,7 +660,7 @@ def main():
         if args.socks_user:
             urltest_inbound["users"] = [{"username": args.socks_user, "password": args.socks_pass}]
 
-        inbounds.append(urltest_inbound)
+        add_inbound(urltest_inbound)
         rules.append({"inbound": urltest_in_tag, "outbound": urltest_out_tag})
         urltest_socks_line = f"socks5h://{auth_prefix}{args.listen}:{args.urltest_port}"
 
