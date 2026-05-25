@@ -125,6 +125,10 @@ def parse_uri_subscription(text: str):
             p = parse_trojan_uri(url)
             if p:
                 proxies.append(p)
+        elif url.startswith("anytls://"):
+            p = parse_anytls_uri(url)
+            if p:
+                proxies.append(p)
     return proxies
 
 
@@ -214,6 +218,66 @@ def parse_trojan_uri(uri: str):
         return None
 
 
+def parse_anytls_uri(uri: str):
+    """
+    anytls://password@host:port?sni=example.com&alpn=h2&client-fingerprint=chrome#name
+
+    There is no single universally accepted AnyTLS URI schema yet; this parser handles
+    the common password@host:port form and a few common Clash/sing-box option names.
+    """
+    try:
+        parsed = urllib.parse.urlparse(uri)
+        password = urllib.parse.unquote(parsed.username or "")
+        host = parsed.hostname
+        port = parsed.port
+        q = urllib.parse.parse_qs(parsed.query)
+        name = urllib.parse.unquote(parsed.fragment or "") or host
+
+        if not (host and port and password):
+            return None
+
+        def q_first(*names):
+            for key in names:
+                vals = q.get(key)
+                if vals:
+                    return vals[0]
+            return None
+
+        p = {
+            "type": "anytls",
+            "name": name,
+            "server": host,
+            "port": int(port),
+            "password": password,
+        }
+
+        sni = q_first("sni", "peer", "peername", "servername", "server_name")
+        if sni:
+            p["sni"] = sni
+        insecure = q_first("allowInsecure", "allow-insecure", "skip-cert-verify", "insecure")
+        if insecure is not None:
+            p["skip-cert-verify"] = norm_bool(insecure, default=False)
+        client_fp = q_first("client-fingerprint", "client_fingerprint", "fingerprint")
+        if client_fp:
+            p["client-fingerprint"] = client_fp
+        alpn = q_first("alpn")
+        if alpn:
+            p["alpn"] = [x.strip() for x in alpn.split(",") if x.strip()]
+        idle_check = q_first("idle-session-check-interval", "idle_session_check_interval")
+        if idle_check:
+            p["idle-session-check-interval"] = idle_check
+        idle_timeout = q_first("idle-session-timeout", "idle_session_timeout")
+        if idle_timeout:
+            p["idle-session-timeout"] = idle_timeout
+        min_idle = q_first("min-idle-session", "min_idle_session")
+        if min_idle is not None:
+            p["min-idle-session"] = int(min_idle)
+
+        return p
+    except Exception:
+        return None
+
+
 def stable_port_assign(keys, base_port: int, port_range: int):
     """
     按顺序依次分配端口：第 i 个节点分配 base_port + i。
@@ -232,6 +296,39 @@ def norm_bool(v, default=False):
         return v != 0
     s = str(v).strip().lower()
     return s in ("1", "true", "yes", "y", "on")
+
+
+def norm_duration(v):
+    """Convert Clash numeric second durations to sing-box duration strings."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return f"{int(v)}s"
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return f"{s}s"
+    return s
+
+
+def as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip()]
+    if isinstance(v, tuple):
+        return [str(x) for x in v if str(x).strip()]
+    return [x.strip() for x in str(v).split(",") if x.strip()]
+
+
+def first_present(d: dict, *keys):
+    for key in keys:
+        if key in d and d.get(key) is not None:
+            return d.get(key)
+    return None
 
 
 def build_outbound_from_clash_proxy(p: dict):
@@ -293,6 +390,78 @@ def build_outbound_from_clash_proxy(p: dict):
         uniq_key = f"trojan|{server}|{port}|{password}|{sni or ''}|insecure={int(insecure)}"
         return tag, uniq_key, ob
 
+    if ptype in ("anytls", "any-tls"):
+        server = p.get("server")
+        port = int(p.get("port"))
+        password = p.get("password")
+        sni = first_present(p, "sni", "servername", "server_name", "peer", "peername")
+        raw_insecure = first_present(p, "skip-cert-verify", "allowInsecure", "allow-insecure", "insecure")
+        cert_fingerprint = p.get("fingerprint")
+        if raw_insecure is None and cert_fingerprint:
+            # Clash/Mihomo AnyTLS 的 fingerprint 是服务端证书 SHA-256（常用于自签证书）。
+            # sing-box 没有等价的“证书指纹”字段；若继续按系统 CA 校验会报
+            # "x509: certificate signed by unknown authority"。这里按订阅意图跳过 CA 校验。
+            insecure = True
+        else:
+            insecure = norm_bool(raw_insecure, default=False)
+
+        if not (server and port and password):
+            raise ValueError(f"AnyTLS 节点字段不完整：{name}")
+
+        ob = {
+            "type": "anytls",
+            "tag": tag,
+            "server": server,
+            "server_port": port,
+            "password": password,
+            "tls": {
+                "enabled": True,
+                "insecure": insecure,
+            },
+        }
+
+        idle_check = norm_duration(first_present(p, "idle-session-check-interval", "idle_session_check_interval"))
+        if idle_check:
+            ob["idle_session_check_interval"] = idle_check
+        idle_timeout = norm_duration(first_present(p, "idle-session-timeout", "idle_session_timeout"))
+        if idle_timeout:
+            ob["idle_session_timeout"] = idle_timeout
+        min_idle = first_present(p, "min-idle-session", "min_idle_session")
+        if min_idle is not None:
+            ob["min_idle_session"] = int(min_idle)
+
+        if sni:
+            ob["tls"]["server_name"] = str(sni)
+        alpn = as_list(p.get("alpn"))
+        if alpn:
+            ob["tls"]["alpn"] = alpn
+        client_fp = first_present(p, "client-fingerprint", "client_fingerprint")
+        if client_fp:
+            ob["tls"]["utls"] = {
+                "enabled": True,
+                "fingerprint": str(client_fp),
+            }
+
+        # sing-box 支持的是 certificate_public_key_sha256（公钥指纹），
+        # Clash/Mihomo 常见的 fingerprint 通常是证书指纹，二者不能直接等价转换。
+        cert_pubkey_sha256 = first_present(
+            p,
+            "certificate-public-key-sha256",
+            "certificate_public_key_sha256",
+            "certificate-public-key-sha256-list",
+            "certificate_public_key_sha256_list",
+        )
+        if cert_pubkey_sha256:
+            ob["tls"]["certificate_public_key_sha256"] = as_list(cert_pubkey_sha256)
+        # Clash/Mihomo 的 fingerprint 是服务端证书 SHA-256；sing-box 的
+        # certificate_public_key_sha256 是证书公钥 SHA-256，不能从证书指纹直接换算。
+
+        uniq_key = (
+            f"anytls|{server}|{port}|{password}|{sni or ''}|insecure={int(insecure)}|"
+            f"alpn={','.join(alpn)}|client_fp={client_fp or ''}"
+        )
+        return tag, uniq_key, ob
+
     return None, None, None
 
 
@@ -351,8 +520,8 @@ def main():
     )
     ap.add_argument(
         "--types",
-        default="ss,trojan",
-        help="处理的节点类型（逗号分隔，支持 ss,trojan；默认 ss,trojan）",
+        default="ss,trojan,anytls",
+        help="处理的节点类型（逗号分隔，支持 ss,trojan,anytls；默认 ss,trojan,anytls）",
     )
     ap.add_argument(
         "--tag-pattern",
@@ -594,7 +763,7 @@ def main():
             for line in socks_lines:
                 print(line)
         if warnings:
-            print("\n注意：发现部分节点包含 plugin 等字段，脚本未自动转换：")
+            print("\n注意：发现部分节点包含未自动转换的字段：")
             for w in warnings[:20]:
                 print("  -", w)
             if len(warnings) > 20:
@@ -697,7 +866,7 @@ def main():
         print("urltest 聚合入口：")
         print(urltest_socks_line)
     if warnings:
-        print("\n注意：发现部分节点包含 plugin 等字段，脚本未自动转换：")
+        print("\n注意：发现部分节点包含未自动转换的字段：")
         for w in warnings[:20]:
             print("  -", w)
         if len(warnings) > 20:
